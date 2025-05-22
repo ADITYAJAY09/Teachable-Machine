@@ -2,13 +2,11 @@ import os
 import numpy as np
 import pandas as pd
 from flask import Flask, render_template, request, jsonify
-import tensorflow as tf
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Dense, Dropout
-from tensorflow.keras.optimizers import Adam
-from werkzeug.utils import secure_filename
-from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, mean_absolute_error
+from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = 'uploads'
@@ -25,6 +23,7 @@ predictions = []
 model_performance = None
 selected_features = []
 scaler = None
+encoder = None
 
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in app.config['ALLOWED_EXTENSIONS']
@@ -33,65 +32,24 @@ def preprocess_data(raw_data, selected_features, target_column):
     processed_data = []
     for row in raw_data:
         try:
-            feature_values = [float(row[feature]) if not pd.isna(row[feature]) else 0.0 for feature in selected_features]
-            if task_type == 'classification':
-                target_value = int(float(row[target_column])) if not pd.isna(row[target_column]) else 0
-            else:
-                target_value = float(row[target_column]) if not pd.isna(row[target_column]) else 0.0
+            feature_values = [float(row[feature]) if not pd.isna(row[feature]) else 0.0 
+                           for feature in selected_features]
+            target_value = row[target_column]
             
-            if all(not np.isnan(f) for f in feature_values) and not np.isnan(target_value):
+            if all(not np.isnan(f) for f in feature_values) and not pd.isna(target_value):
                 processed_data.append({'features': feature_values, 'target': target_value})
         except (ValueError, TypeError):
             continue
     return processed_data
 
-def create_model(input_shape, output_shape, task_type):
-    model = Sequential()
-    
-    # Input layer
-    model.add(Dense(
-        units=max(32, input_shape * 2),
-        activation='relu',
-        input_shape=(input_shape,)
-    ))
-    
-    # Hidden layers
-    model.add(Dropout(0.3))
-    model.add(Dense(
-        units=max(16, input_shape),
-        activation='relu'
-    ))
-    
-    model.add(Dropout(0.2))
-    
-    # Output layer
+def create_model(task_type):
     if task_type == 'classification':
-        model.add(Dense(
-            units=output_shape,
-            activation='softmax' if output_shape > 2 else 'sigmoid'
-        ))
-        
-        model.compile(
-            optimizer=Adam(learning_rate=0.001),
-            loss='sparse_categorical_crossentropy' if output_shape > 2 else 'binary_crossentropy',
-            metrics=['accuracy']
-        )
+        return RandomForestClassifier(n_estimators=100, random_state=42)
     else:
-        model.add(Dense(
-            units=1,
-            activation='linear'
-        ))
-        
-        model.compile(
-            optimizer=Adam(learning_rate=0.001),
-            loss='mean_squared_error',
-            metrics=['mean_absolute_error']
-        )
-    
-    return model
+        return RandomForestRegressor(n_estimators=100, random_state=42)
 
 def train_model():
-    global model, training_history, predictions, model_performance, scaler
+    global model, training_history, predictions, model_performance, scaler, encoder
     
     if data is None or len(selected_features) == 0 or not target:
         return {'error': 'Please upload data and select features and target'}, 400
@@ -105,6 +63,11 @@ def train_model():
     X = np.array([item['features'] for item in processed_data])
     y = np.array([item['target'] for item in processed_data])
     
+    # Encode target if classification
+    if task_type == 'classification':
+        encoder = LabelEncoder()
+        y = encoder.fit_transform(y)
+    
     # Normalize features
     scaler = StandardScaler()
     X = scaler.fit_transform(X)
@@ -112,58 +75,28 @@ def train_model():
     # Split data
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
     
-    # Determine output shape
-    if task_type == 'classification':
-        output_shape = len(np.unique(y_train))
-    else:
-        output_shape = 1
-    
-    # Create model
-    model = create_model(len(selected_features), output_shape, task_type)
-    
-    # Train model
-    history = model.fit(
-        X_train, y_train,
-        epochs=50,
-        batch_size=32,
-        validation_split=0.2,
-        verbose=0
-    )
-    
-    # Store training history
-    training_history = []
-    for i in range(len(history.history['loss'])):
-        epoch_data = {
-            'epoch': i + 1,
-            'loss': history.history['loss'][i],
-            'val_loss': history.history['val_loss'][i]
-        }
-        
-        if task_type == 'classification':
-            epoch_data['accuracy'] = history.history['accuracy'][i]
-            epoch_data['val_accuracy'] = history.history['val_accuracy'][i]
-        else:
-            epoch_data['mean_absolute_error'] = history.history['mean_absolute_error'][i]
-            epoch_data['val_mean_absolute_error'] = history.history['val_mean_absolute_error'][i]
-        
-        training_history.append(epoch_data)
-    
-    # Evaluate model
-    evaluation = model.evaluate(X_test, y_test, verbose=0)
-    
-    model_performance = {
-        'test_loss': evaluation[0],
-        'test_metric': evaluation[1],
-        'metric_name': 'accuracy' if task_type == 'classification' else 'mean_absolute_error'
-    }
+    # Create and train model
+    model = create_model(task_type)
+    model.fit(X_train, y_train)
     
     # Make predictions
     y_pred = model.predict(X_test)
-    if task_type == 'classification':
-        y_pred = np.argmax(y_pred, axis=1) if output_shape > 2 else np.round(y_pred).flatten()
-    else:
-        y_pred = y_pred.flatten()
     
+    # Calculate performance metrics
+    if task_type == 'classification':
+        accuracy = accuracy_score(y_test, y_pred)
+        model_performance = {
+            'test_metric': accuracy,
+            'metric_name': 'accuracy'
+        }
+    else:
+        mae = mean_absolute_error(y_test, y_pred)
+        model_performance = {
+            'test_metric': mae,
+            'metric_name': 'mean_absolute_error'
+        }
+    
+    # Store sample predictions
     predictions = []
     for i in range(min(10, len(X_test))):
         predictions.append({
@@ -175,7 +108,7 @@ def train_model():
     return {'status': 'Model trained successfully'}
 
 def make_prediction(input_features):
-    global model, scaler
+    global model, scaler, encoder
     
     if model is None or scaler is None:
         return None
@@ -188,14 +121,9 @@ def make_prediction(input_features):
         # Make prediction
         prediction = model.predict(normalized_input)
         
-        if task_type == 'classification':
-            output_shape = model.layers[-1].output_shape[-1]
-            if output_shape > 2:
-                return np.argmax(prediction[0])
-            else:
-                return np.round(prediction[0][0])
-        else:
-            return prediction[0][0]
+        if task_type == 'classification' and encoder:
+            return encoder.inverse_transform([int(prediction[0])])[0]
+        return prediction[0]
     except Exception as e:
         print(f"Prediction error: {e}")
         return None
@@ -243,7 +171,7 @@ def index():
         target=target,
         task_type=task_type,
         selected_features=selected_features,
-        training_history=training_history[-10:],
+        training_history=training_history[-10:] if training_history else [],
         model_performance=model_performance,
         predictions=predictions,
         model_exists=model is not None
@@ -260,7 +188,7 @@ def predict():
         prediction = make_prediction(input_features)
         
         if prediction is not None:
-            return jsonify({'prediction': float(prediction)})
+            return jsonify({'prediction': str(prediction)})
         else:
             return jsonify({'error': 'Prediction failed'}), 400
     except Exception as e:
